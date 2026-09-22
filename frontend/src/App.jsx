@@ -114,11 +114,13 @@ export default function App() {
   const [category, setCategory] = useState('Todos');
   const [sizeFilter, setSizeFilter] = useState('Todos');
   const [statusFilter, setStatusFilter] = useState('Pendientes');
+  const [recentlyCompleted, setRecentlyCompleted] = useState([]);
   const [newId, setNewId] = useState('');
   const [newName, setNewName] = useState('');
   const [newQty, setNewQty] = useState('1');
   const fileInputRef = useRef(null);
   const patchQueue = useRef(new Map());
+  const receivedRef = useRef(new Map());
 
   async function loadState(preferredOrderId) {
     try {
@@ -139,6 +141,12 @@ export default function App() {
 
   useEffect(() => { loadState(); }, []);
 
+  useEffect(() => {
+    const next = new Map();
+    state.items.forEach((item) => next.set(item.id, item.received));
+    receivedRef.current = next;
+  }, [state.items]);
+
   const activeOrder = state.orders.find((order) => order.id === activeOrderId);
   const orderItems = state.items.filter((item) => item.orderId === activeOrderId);
   const productsById = useMemo(() => Object.fromEntries(state.products.map((product) => [product.id, product])), [state.products]);
@@ -156,7 +164,7 @@ export default function App() {
     const matchesCategory = category === 'Todos' || product.category === category;
     const matchesSize = sizeFilter === 'Todos' || product.sizeMl === Number(sizeFilter);
     const matchesStatus = statusFilter === 'Todos'
-      || (statusFilter === 'Pendientes' && item.received < item.expected)
+      || (statusFilter === 'Pendientes' && (item.received < item.expected || recentlyCompleted.includes(item.id)))
       || (statusFilter === 'Completos' && item.received >= item.expected);
     return matchesQuery && matchesCategory && matchesSize && matchesStatus;
   });
@@ -227,16 +235,36 @@ export default function App() {
 
   function changeReceived(item, delta) {
     if (readOnly) return;
-    const nextReceived = Math.max(0, item.received + delta);
-    if (nextReceived === item.received) return;
+
+    // El contador se actualiza primero en memoria para que cada toque responda
+    // al instante, incluso si el usuario pulsa + varias veces muy rápido.
+    const currentReceived = receivedRef.current.has(item.id)
+      ? receivedRef.current.get(item.id)
+      : item.received;
+    const nextReceived = Math.max(0, currentReceived + delta);
+    if (nextReceived === currentReceived) return;
+
+    if (nextReceived >= item.expected && currentReceived < item.expected) {
+      setRecentlyCompleted((current) => current.includes(item.id) ? current : [...current, item.id]);
+      window.setTimeout(() => {
+        setRecentlyCompleted((current) => current.filter((id) => id !== item.id));
+      }, 1800);
+    }
+
+    receivedRef.current.set(item.id, nextReceived);
     setState((current) => ({
       ...current,
-      items: current.items.map((candidate) => candidate.id === item.id ? { ...candidate, received: nextReceived } : candidate),
+      items: current.items.map((candidate) => candidate.id === item.id
+        ? { ...candidate, received: nextReceived }
+        : candidate),
     }));
 
+    // Guardamos en segundo plano, en orden, sin frenar la interfaz.
+    // Es importante esperar fetch antes de pasar la respuesta a readResponse;
+    // de lo contrario el contador podía volver atrás aunque el toque sí se hubiera hecho.
     const request = (patchQueue.current.get(item.id) || Promise.resolve())
       .catch(() => undefined)
-      .then(() => readResponse(fetch(apiUrl(`/api/items/${item.id}`), {
+      .then(async () => readResponse(await fetch(apiUrl(`/api/items/${item.id}`), {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ received: nextReceived }),
@@ -244,6 +272,9 @@ export default function App() {
       .catch(async (error) => {
         await loadState(activeOrderId);
         setMessage(`${error.message} Revisa el contador antes de continuar.`);
+      })
+      .finally(() => {
+        if (patchQueue.current.get(item.id) === request) patchQueue.current.delete(item.id);
       });
     patchQueue.current.set(item.id, request);
   }

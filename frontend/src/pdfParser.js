@@ -53,9 +53,9 @@ function groupTextItems(items) {
 }
 
 function productIdFromRow(row, maxX = 110) {
-  const chunk = row.chunks?.find((part) => part.x < maxX && /^\d{3,6}$/.test(part.str.trim()));
+  const chunk = row.chunks?.find((part) => part.x < maxX && /^\d{3,10}$/.test(part.str.trim()));
   if (chunk) return chunk.str.trim();
-  const exact = row.text.match(/^\s*(\d{3,6})\s*$/);
+  const exact = row.text.match(/^\s*(\d{3,10})\s*$/);
   return exact?.[1] || null;
 }
 
@@ -189,66 +189,76 @@ function parseJuntosPdf(pages) {
   const rows = flattenPages(pages);
   const allText = rows.map((row) => row.text).join('\n');
   const externalId = allText.match(/[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}/i)?.[0] || '';
-  const productsIndex = rows.findIndex((row) => /\bProductos\b/.test(row.text) && !/ID Producto/.test(row.text));
-  const expectedLines = productsIndex >= 0 && rows[productsIndex + 1]
-    ? Number(textFromX(rows[productsIndex + 1], 295, 340)) || Number(rows[productsIndex + 1].text.match(/^\d+$/)?.[0]) || null
-    : null;
   const warnings = [];
   const items = [];
 
-  // This format is table-like. Each row with an ID starts a product. We keep a small
-  // rolling buffer so a wrapped description can continue on the next visual row/page.
-  let active = false;
-  let current = null;
-  const commit = () => {
-    if (!current) return;
-    if (current.name && Number.isInteger(current.quantity) && current.quantity > 0) {
-      items.push({ productId: current.productId, name: normalizeSpaces(current.name), quantity: current.quantity });
-    } else {
-      warnings.push(`Revisar renglón con ID ${current.productId}.`);
-    }
-    current = null;
-  };
+  // The PDF says how many product rows are in the order. Keep this number so the
+  // review screen can stop the user from saving a partially parsed ticket.
+  const expectedFromText = allText.match(/(?:^|\n)Productos\s+(\d{1,3})(?:\n|$)/i)?.[1];
+  const productsIndex = rows.findIndex((row) => /\bProductos\b/.test(row.text) && !/ID Producto/.test(row.text));
+  const expectedLines = Number(expectedFromText)
+    || (productsIndex >= 0 && rows[productsIndex + 1]
+      ? Number(textFromX(rows[productsIndex + 1], 295, 340)) || Number(rows[productsIndex + 1].text.match(/^\d+$/)?.[0]) || null
+      : null);
 
-  for (const row of rows) {
-    if (/ID\s+Producto/i.test(row.text)) {
-      active = true;
-      continue;
-    }
-    if (/^Resumen\b/i.test(row.text)) {
-      commit();
-      active = false;
-    }
-    if (!active) continue;
+  // Juntos+ is a real table, but PDF.js does not always put all cells of a row at
+  // exactly the same Y coordinate. For example, an ID can be a few pixels below
+  // its product name, and wrapped promotional names can span lines above and below
+  // the ID. Parsing "the next text row" therefore merges adjacent products.
+  //
+  // Instead, use every product ID as a vertical anchor and assign the surrounding
+  // table rows to the nearest ID. Then read the Product and Quantity columns from
+  // that vertical zone. This also supports 8-digit promotion IDs such as 60088799.
+  for (const pageRows of pages) {
+    const headerIndex = pageRows.findIndex((row) => /\bID\b/i.test(row.text) && /Producto/i.test(row.text) && /Cantidad/i.test(row.text));
+    if (headerIndex < 0) continue;
 
-    const id = productIdFromRow(row);
-    if (id) {
-      commit();
-      const quantityRaw = amountFromX(row);
-      let name = textFromX(row, 108, 310);
-      if (!name && row.text) {
-        name = normalizeSpaces(row.text.replace(/^\s*\d{3,6}\s+/, '').replace(/\s+Precio por Pieza.*$/i, ''));
+    let tableRows = pageRows.slice(headerIndex + 1);
+    const summaryIndex = tableRows.findIndex((row) => /^Resumen\b/i.test(normalizeSpaces(row.text)));
+    if (summaryIndex >= 0) tableRows = tableRows.slice(0, summaryIndex);
+
+    const anchors = tableRows
+      .map((row) => ({ row, productId: productIdFromRow(row, 125) }))
+      .filter((entry) => entry.productId);
+
+    for (let index = 0; index < anchors.length; index += 1) {
+      const anchor = anchors[index];
+      const previousY = index > 0 ? anchors[index - 1].row.y : Number.POSITIVE_INFINITY;
+      const nextY = index + 1 < anchors.length ? anchors[index + 1].row.y : Number.NEGATIVE_INFINITY;
+      const upperBoundary = Number.isFinite(previousY) ? (previousY + anchor.row.y) / 2 : Number.POSITIVE_INFINITY;
+      const lowerBoundary = Number.isFinite(nextY) ? (anchor.row.y + nextY) / 2 : Number.NEGATIVE_INFINITY;
+
+      const zone = tableRows.filter((row) => row.y < upperBoundary && row.y >= lowerBoundary);
+
+      const nameParts = zone
+        .map((row) => textFromX(row, 120, 325))
+        .map(normalizeSpaces)
+        .filter((value) => (
+          value
+          && /[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(value)
+          && !/^(Producto|Descripción|Cantidad|Precio|Total|Precio por|Pieza)$/i.test(value)
+        ));
+
+      const name = normalizeSpaces(nameParts.join(' '));
+      const quantityCandidates = [];
+      for (const row of zone) {
+        for (const part of row.chunks || []) {
+          const raw = part.str?.trim();
+          if (part.x >= 390 && part.x < 445 && /^\d{1,4}$/.test(raw || '')) {
+            quantityCandidates.push({ quantity: Number(raw), distance: Math.abs(row.y - anchor.row.y) });
+          }
+        }
       }
-      current = {
-        productId: id,
-        name,
-        quantity: quantityRaw ? Number(quantityRaw) : null,
-      };
-      continue;
-    }
+      quantityCandidates.sort((a, b) => a.distance - b.distance);
+      const quantity = quantityCandidates[0]?.quantity ?? null;
 
-    if (!current || isPageNoise(row.text)) continue;
-    if (!current.quantity) {
-      const columnQty = amountFromX(row);
-      const textualQty = row.text.match(/(?:Precio por Pieza\s+)?(\d{1,3})\s+\$?/i)?.[1];
-      if (columnQty || textualQty) current.quantity = Number(columnQty || textualQty);
-    }
-    if (!/Precio por Pieza|^Pieza$/i.test(row.text) && !looksLikePrice(row.text)) {
-      const extra = textFromX(row, 108, 310);
-      if (extra && /[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(extra)) current.name = normalizeSpaces(`${current.name} ${extra}`);
+      if (name && Number.isInteger(quantity) && quantity > 0) {
+        items.push({ productId: anchor.productId, name, quantity });
+      } else {
+        warnings.push(`Revisar renglón con ID ${anchor.productId}: no se pudo leer ${!name ? 'el nombre' : 'la cantidad'}.`);
+      }
     }
   }
-  commit();
 
   if (!externalId) warnings.push('No se encontró el número de pedido.');
   if (expectedLines === null) warnings.push('No se encontró el total de productos del PDF.');
@@ -290,7 +300,7 @@ function parseDeliveryNote(pages) {
     const id = productIdFromRow(row, 75);
     if (id) {
       let name = textFromX(row, 75, 370);
-      if (!name) name = normalizeSpaces(row.text.replace(/^\s*\d{3,6}\s+/, ''));
+      if (!name) name = normalizeSpaces(row.text.replace(/^\s*\d{3,10}\s+/, ''));
       if (name) provisional.push({ productId: id, name, quantity: 0 });
       continue;
     }

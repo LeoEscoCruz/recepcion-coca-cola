@@ -118,6 +118,10 @@ export default function App() {
   const [newId, setNewId] = useState('');
   const [newName, setNewName] = useState('');
   const [newQty, setNewQty] = useState('1');
+  const [manualOpen, setManualOpen] = useState(false);
+  const [manualId, setManualId] = useState('');
+  const [manualName, setManualName] = useState('');
+  const [manualQty, setManualQty] = useState('1');
   const fileInputRef = useRef(null);
   const patchQueue = useRef(new Map());
   const receivedRef = useRef(new Map());
@@ -204,7 +208,7 @@ export default function App() {
   const previewValid = Boolean(
     preview?.externalId
     && preview.items.length
-    && preview.items.every((item) => /^\d{3,6}$/.test(item.productId) && item.name.trim() && Number.isInteger(item.quantity) && item.quantity > 0)
+    && preview.items.every((item) => /^\d{3,10}$/.test(item.productId) && item.name.trim() && Number.isInteger(item.quantity) && item.quantity > 0)
     && (preview.expectedLines === null || preview.items.length === preview.expectedLines)
     && (preview.expectedUnits === null || preview.items.reduce((sum, item) => sum + item.quantity, 0) === preview.expectedUnits),
   );
@@ -226,6 +230,28 @@ export default function App() {
       setStatusFilter('Pendientes');
       await loadState(result.orderId);
       if (result.alreadyExists) setMessage('Este pedido ya estaba guardado. Abrimos el registro existente.');
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function addManualItemToOrder() {
+    if (!activeOrder || readOnly || !/^\d{3,10}$/.test(manualId) || !manualName.trim() || Number(manualQty) < 1) return;
+    setSaving(true);
+    try {
+      await readResponse(await fetch(apiUrl(`/api/orders/${activeOrder.id}/items`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ productId: manualId, name: manualName.trim(), quantity: Number(manualQty) }),
+      }));
+      setManualOpen(false);
+      setManualId('');
+      setManualName('');
+      setManualQty('1');
+      await loadState(activeOrder.id);
+      setMessage('Producto agregado al pedido.');
     } catch (error) {
       setMessage(error.message);
     } finally {
@@ -350,6 +376,7 @@ export default function App() {
                   <p>{activeOrder.source} · {activeOrder.externalId}</p>
                 </div>
                 <div className="heading-actions">
+                  {!readOnly && <button className="button outline" type="button" onClick={() => setManualOpen(true)}><Plus size={17} /> Agregar producto</button>}
                   <button className="button outline" type="button" onClick={() => setSummaryOpen(true)}>Resumen</button>
                   <label className="mobile-orders-select">
                     <History size={16} />
@@ -417,12 +444,26 @@ export default function App() {
           {preview.expectedLines !== null && <p className={preview.items.length === preview.expectedLines ? 'check-line' : 'error-line'}>El PDF indica {preview.expectedLines} productos · Se leyeron {preview.items.length}</p>}
           {preview.expectedUnits !== null && <p className={preview.items.reduce((sum, item) => sum + (Number(item.quantity) || 0), 0) === preview.expectedUnits ? 'check-line' : 'error-line'}>La nota indica {preview.expectedUnits} unidades en total</p>}
           {preview.warnings.map((warning, index) => <p className="preview-warning" key={`${warning}-${index}`}><AlertCircle size={16} /> {warning}</p>)}
+          <div className="manual-add-panel">
+            <div><strong>Agregar producto manualmente</strong><small>Úsalo si un renglón del PDF no fue detectado. También puedes corregir directamente cualquier producto de la lista.</small></div>
+            <div className="add-row"><input placeholder="ID" inputMode="numeric" value={newId} onChange={(event) => setNewId(event.target.value.replace(/\D/g, '').slice(0, 10))} /><input placeholder="Producto" value={newName} onChange={(event) => setNewName(event.target.value)} /><input aria-label="Cantidad" type="number" min="1" value={newQty} onChange={(event) => setNewQty(event.target.value)} /><button className="button outline" type="button" disabled={!/^\d{3,10}$/.test(newId) || !newName.trim() || Number(newQty) < 1} onClick={() => { setPreview({ ...preview, items: [...preview.items, { productId: newId, name: newName, quantity: Number(newQty) }] }); setNewId(''); setNewName(''); setNewQty('1'); }}><Plus size={17} /> Agregar</button></div>
+          </div>
           <div className="preview-list">{preview.items.map((item, index) => <div className="preview-item" key={`${item.productId}-${index}`}><input className="preview-id" aria-label="ID del producto" value={item.productId} onChange={(event) => updatePreviewItem(index, 'productId', event.target.value)} /><input className="preview-name" aria-label="Nombre del producto" value={item.name} onChange={(event) => updatePreviewItem(index, 'name', event.target.value)} /><input className="preview-qty" aria-label="Cantidad de unidades" type="number" min="1" value={item.quantity || ''} onChange={(event) => updatePreviewItem(index, 'quantity', event.target.value)} /><button className="remove-row" type="button" aria-label="Quitar renglón" onClick={() => setPreview({ ...preview, items: preview.items.filter((_, itemIndex) => itemIndex !== index) })}><X size={18} /></button></div>)}</div>
-          <div className="add-row"><input placeholder="ID" value={newId} onChange={(event) => setNewId(event.target.value)} /><input placeholder="Producto" value={newName} onChange={(event) => setNewName(event.target.value)} /><input type="number" min="1" value={newQty} onChange={(event) => setNewQty(event.target.value)} /><button className="button outline" type="button" disabled={!/^\d{3,6}$/.test(newId) || !newName.trim() || Number(newQty) < 1} onClick={() => { setPreview({ ...preview, items: [...preview.items, { productId: newId, name: newName, quantity: Number(newQty) }] }); setNewId(''); setNewName(''); setNewQty('1'); }}><Plus size={17} /> Agregar</button></div>
           <label className="review-check"><input type="checkbox" checked={reviewChecked} onChange={(event) => setReviewChecked(event.target.checked)} /><span>Comparé los productos y cantidades con el PDF.</span></label>
           {!previewValid && <p className="error-line">Corrige los datos y haz que los totales coincidan antes de guardar.</p>}
           <div className="modal-actions"><button className="button outline" type="button" onClick={() => setPreview(null)}>Cancelar</button><button className="button primary" type="button" disabled={!previewValid || !reviewChecked || saving} onClick={savePreview}>{saving ? 'Guardando…' : 'Guardar y recibir'}</button></div>
         </div>}
+      </Modal>
+
+      <Modal open={manualOpen && Boolean(activeOrder)} onClose={() => setManualOpen(false)} title="Agregar producto manualmente" description="Añade un producto faltante al pedido actual. Se guardará con cantidad recibida en 0.">
+        <div className="preview-body">
+          <div className="manual-order-form">
+            <label>ID del producto<input inputMode="numeric" placeholder="Ej. 60088799" value={manualId} onChange={(event) => setManualId(event.target.value.replace(/\D/g, '').slice(0, 10))} /></label>
+            <label>Cantidad esperada<input type="number" min="1" value={manualQty} onChange={(event) => setManualQty(event.target.value)} /></label>
+            <label className="manual-name-field">Nombre del producto<input placeholder="Ej. 2 Topo Chico Naranjada + 2 Limonada 600 ml" value={manualName} onChange={(event) => setManualName(event.target.value)} /></label>
+          </div>
+          <div className="modal-actions"><button className="button outline" type="button" onClick={() => setManualOpen(false)}>Cancelar</button><button className="button primary" type="button" disabled={saving || !/^\d{3,10}$/.test(manualId) || !manualName.trim() || Number(manualQty) < 1} onClick={addManualItemToOrder}>{saving ? 'Agregando…' : 'Agregar al pedido'}</button></div>
+        </div>
       </Modal>
 
       <Modal open={summaryOpen && Boolean(activeOrder)} onClose={() => setSummaryOpen(false)} title="Resumen del pedido" description={activeOrder ? `${formatDate(activeOrder.deliveryDate, activeOrder.createdAt)} · ${orderItems.length} productos` : ''} wide>

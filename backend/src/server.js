@@ -110,7 +110,7 @@ app.post('/api/orders', async (req, res) => {
   const items = Array.isArray(payload.items) ? payload.items : [];
 
   if (!externalId || !source || !items.length) return res.status(400).json({ error: 'El pedido importado está incompleto.' });
-  if (!items.every((item) => /^\d{3,6}$/.test(String(item.productId)) && cleanString(item.name) && Number.isInteger(Number(item.quantity)) && Number(item.quantity) > 0)) {
+  if (!items.every((item) => /^\d{3,10}$/.test(String(item.productId)) && cleanString(item.name) && Number.isInteger(Number(item.quantity)) && Number(item.quantity) > 0)) {
     return res.status(400).json({ error: 'Hay productos con ID, nombre o cantidad inválidos.' });
   }
 
@@ -144,6 +144,49 @@ app.post('/api/orders', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'No se pudo guardar el pedido.' });
+  }
+});
+
+app.post('/api/orders/:id/items', async (req, res) => {
+  const productId = cleanString(req.body?.productId, 20);
+  const name = cleanString(req.body?.name);
+  const quantity = Number(req.body?.quantity);
+
+  if (!/^\d{3,10}$/.test(productId) || !name || !Number.isInteger(quantity) || quantity < 1 || quantity > 9999) {
+    return res.status(400).json({ error: 'ID, nombre o cantidad inválidos.' });
+  }
+
+  try {
+    const { data: order, error: orderError } = await supabase.from('orders').select('id,status').eq('id', req.params.id).single();
+    if (orderError) throw orderError;
+    if (order.status === 'completed') return res.status(409).json({ error: 'El pedido ya está finalizado y no puede modificarse.' });
+
+    const { data: existing, error: existingError } = await supabase
+      .from('order_items')
+      .select('id')
+      .eq('order_id', order.id)
+      .eq('product_id', productId)
+      .maybeSingle();
+    if (existingError) throw existingError;
+    if (existing) return res.status(409).json({ error: 'Ese producto ya existe en el pedido. Corrige su cantidad desde la vista previa antes de guardar.' });
+
+    const product = { id: productId, ...classifyProduct(name) };
+    const { error: productError } = await supabase.from('products').upsert(product, { onConflict: 'id' });
+    if (productError) throw productError;
+
+    const { data: item, error: itemError } = await supabase.from('order_items').insert({
+      order_id: order.id,
+      product_id: productId,
+      original_name: name,
+      expected: quantity,
+      received: 0,
+    }).select('*').single();
+    if (itemError) throw itemError;
+
+    res.status(201).json({ item: mapItem(item) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'No se pudo agregar el producto al pedido.' });
   }
 });
 
